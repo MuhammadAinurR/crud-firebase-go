@@ -6,166 +6,163 @@ import (
 	"log"
 	"net/http"
 
-	firebase "firebase.google.com/auth"
-
+	"cloud.google.com/go/firestore"
+	firebase "firebase.google.com/go"
+	"github.com/gorilla/mux"
+	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
 
-var (
-	firebaseApp *firebase.App
-)
+// Item represents a generic item in our collection
+type Item struct {
+	ID          string `json:"id,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+}
 
-type Todo struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
+func initFirebase() *firestore.Client {
+	opt := option.WithCredentialsFile("service.json")
+	app, err := firebase.NewApp(context.Background(), nil, opt)
+	if err != nil {
+		log.Fatalf("error initializing app: %v", err)
+	}
+
+	client, err := app.Firestore(context.Background())
+	if err != nil {
+		log.Fatalf("error getting Firestore client: %v", err)
+	}
+
+	return client
+}
+
+func createItem(client *firestore.Client, item Item) (*firestore.DocumentRef, error) {
+	docRef, _, err := client.Collection("items").Add(context.Background(), item)
+	return docRef, err
+}
+
+func getItem(client *firestore.Client, id string) (*Item, error) {
+	doc, err := client.Collection("items").Doc(id).Get(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	var item Item
+	doc.DataTo(&item)
+	item.ID = doc.Ref.ID
+	return &item, nil
+}
+
+func deleteItem(client *firestore.Client, id string) error {
+	_, err := client.Collection("items").Doc(id).Delete(context.Background())
+	return err
+}
+
+func updateItem(client *firestore.Client, id string, item Item) error {
+	_, err := client.Collection("items").Doc(id).Set(context.Background(), item)
+	return err
+}
+
+func getAllItems(client *firestore.Client) ([]Item, error) {
+	var items []Item
+	iter := client.Collection("items").Documents(context.Background())
+	defer iter.Stop()
+
+	for {
+		doc, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		var item Item
+		doc.DataTo(&item)
+		item.ID = doc.Ref.ID
+		items = append(items, item)
+	}
+
+	return items, nil
+}
+
+func handleCreateItem(client *firestore.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var item Item
+		json.NewDecoder(r.Body).Decode(&item)
+		docRef, err := createItem(client, item)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		item.ID = docRef.ID
+		json.NewEncoder(w).Encode(item)
+	}
+}
+
+func handleGetItem(client *firestore.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		id := vars["id"]
+		item, err := getItem(client, id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(item)
+	}
+}
+
+func handleUpdateItem(client *firestore.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		id := vars["id"]
+
+		var item Item
+		json.NewDecoder(r.Body).Decode(&item)
+		err := updateItem(client, id, item)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		item.ID = id
+		json.NewEncoder(w).Encode(item)
+	}
+}
+
+func handleDeleteItem(client *firestore.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		id := vars["id"]
+		err := deleteItem(client, id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+func handleGetAllItems(client *firestore.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		items, err := getAllItems(client)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(items)
+	}
 }
 
 func main() {
-	// Initialize Firebase Admin SDK
-	opt := option.WithCredentialsFile("path/to/your/serviceAccountKey.json")
-	app, err := firebase.NewApp(context.Background(), nil, opt)
-	if err != nil {
-		log.Fatalf("Error initializing Firebase app: %v", err)
-	}
-
-	firebaseApp = app
-
-	// Initialize Firebase Realtime Database client
-	client, err := app.DatabaseURL(context.Background())
-	if err != nil {
-		log.Fatalf("Error initializing database client: %v", err)
-	}
+	client := initFirebase()
 	defer client.Close()
 
-	router := mux.NewRouter()
+	r := mux.NewRouter()
+	r.HandleFunc("/item", handleCreateItem(client)).Methods("POST")
+	r.HandleFunc("/item/{id}", handleGetItem(client)).Methods("GET")
+	r.HandleFunc("/item", handleGetAllItems(client)).Methods("GET")
+	r.HandleFunc("/item/{id}", handleUpdateItem(client)).Methods("PUT")
+	r.HandleFunc("/item/{id}", handleDeleteItem(client)).Methods("DELETE")
 
-	// Define API endpoints
-	router.HandleFunc("/todos", createTodo).Methods("POST")
-	router.HandleFunc("/todos", getTodos).Methods("GET")
-	router.HandleFunc("/todos/{id}", getTodo).Methods("GET")
-	router.HandleFunc("/todos/{id}", updateTodo).Methods("PUT")
-	router.HandleFunc("/todos/{id}", deleteTodo).Methods("DELETE")
-
-	log.Fatal(http.ListenAndServe(":8080", router))
-}
-
-func createTodo(w http.ResponseWriter, r *http.Request) {
-	var todo Todo
-	_ = json.NewDecoder(r.Body).Decode(&todo)
-
-	// Get a reference to the Firebase Realtime Database
-	ref := firebaseApp.DatabaseURL(context.Background())
-
-	// Push the new todo to the database
-	newTodoRef := ref.NewRef("/todos").Push(context.Background(), &todo)
-
-	// Return the ID of the newly created todo
-	todo.ID = newTodoRef.Key()
-	json.NewEncoder(w).Encode(todo)
-}
-
-func getTodos(w http.ResponseWriter, r *http.Request) {
-	// Get a reference to the Firebase Realtime Database
-	ref := firebaseApp.DatabaseURL(context.Background())
-
-	// Get all todos from the database
-	todosRef := ref.NewRef("/todos")
-	snapshot, err := todosRef.GetOrdered(context.Background())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Convert snapshot to a slice of todos
-	var todos []Todo
-	err = snapshot.ForEach(func(snap db.DataSnapshot) error {
-		var todo Todo
-		if err := snap.Unmarshal(&todo); err != nil {
-			return err
-		}
-		todo.ID = snap.Key()
-		todos = append(todos, todo)
-		return nil
-	})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Return the list of todos
-	json.NewEncoder(w).Encode(todos)
-}
-
-func getTodo(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	todoID := params["id"]
-
-	// Get a reference to the Firebase Realtime Database
-	ref := firebaseApp.DatabaseURL(context.Background())
-
-	// Get the todo by ID from the database
-	todosRef := ref.NewRef("/todos")
-	snapshot, err := todosRef.Child(todoID).Get(context.Background())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Check if the todo exists
-	if !snapshot.Exists() {
-		http.Error(w, "Todo not found", http.StatusNotFound)
-		return
-	}
-
-	// Convert snapshot to a todo
-	var todo Todo
-	if err := snapshot.Unmarshal(&todo); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	todo.ID = snapshot.Key()
-
-	// Return the todo
-	json.NewEncoder(w).Encode(todo)
-}
-
-func updateTodo(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	todoID := params["id"]
-
-	var updatedTodo Todo
-	_ = json.NewDecoder(r.Body).Decode(&updatedTodo)
-
-	// Get a reference to the Firebase Realtime Database
-	ref := firebaseApp.DatabaseURL(context.Background())
-
-	// Update the todo by ID in the database
-	todosRef := ref.NewRef("/todos")
-	if err := todosRef.Child(todoID).Set(context.Background(), &updatedTodo); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Return the updated todo
-	updatedTodo.ID = todoID
-	json.NewEncoder(w).Encode(updatedTodo)
-}
-
-func deleteTodo(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	todoID := params["id"]
-
-	// Get a reference to the Firebase Realtime Database
-	ref := firebaseApp.DatabaseURL(context.Background())
-
-	// Delete the todo by ID from the database
-	todosRef := ref.NewRef("/todos")
-	if err := todosRef.Child(todoID).Delete(context.Background()); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Return success message
-	json.NewEncoder(w).Encode(map[string]string{"message": "Todo deleted successfully"})
+	http.Handle("/", r)
+	log.Println("Server is starting on port 8080...")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
